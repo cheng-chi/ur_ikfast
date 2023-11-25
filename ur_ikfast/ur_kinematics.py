@@ -1,46 +1,18 @@
-import math
 import numpy as np
-
-def quaternion_from_matrix(matrix):
-    """Return quaternion from rotation matrix.
-    >>> R = rotation_matrix(0.123, (1, 2, 3))
-    >>> q = quaternion_from_matrix(R)
-    >>> numpy.allclose(q, [0.0164262, 0.0328524, 0.0492786, 0.9981095])
-    True
-    """
-    q = np.empty((4, ), dtype=np.float64)
-    M = np.array(matrix, dtype=np.float64, copy=False)[:4, :4]
-    t = np.trace(M)
-    if t > M[3, 3]:
-        q[3] = t
-        q[2] = M[1, 0] - M[0, 1]
-        q[1] = M[0, 2] - M[2, 0]
-        q[0] = M[2, 1] - M[1, 2]
-    else:
-        i, j, k = 0, 1, 2
-        if M[1, 1] > M[0, 0]:
-            i, j, k = 1, 2, 0
-        if M[2, 2] > M[i, i]:
-            i, j, k = 2, 0, 1
-        t = M[i, i] - (M[j, j] + M[k, k]) + M[3, 3]
-        q[i] = t
-        q[j] = M[i, j] + M[j, i]
-        q[k] = M[k, i] + M[i, k]
-        q[3] = M[k, j] - M[j, k]
-    q *= 0.5 / math.sqrt(t * M[3, 3])
-    return q
-
-def pose_quaternion_from_matrix(matrix):
-    """Return translation + quaternion(x,y,z,w)
-    """
-    if matrix.shape == (3, 4):
-        matrix = np.concatenate((matrix, [[0, 0, 0, 1]]), axis=0)
-
-    pose = matrix[:3, 3]
-    quat = quaternion_from_matrix(matrix)
-    return np.concatenate((pose, quat), axis=0)
+from scipy.spatial.transform import Rotation
 
 class URKinematics():
+    """
+    The base frame used for ikfast is off by a 180 degree rotation 
+    around the base with the real robot, as shown in:
+    https://github.com/cheng-chi/ur_ikfast/blob/3c9c8b5a1400ea7946b609a4097adae9c8d3c7a8/ur5e/ur5e.urdf#L319
+    Therefore, we compensate this rotation to make outout consistent with real robot.
+    """
+    rx_ikbase_realbase = np.array([
+        [-1,0,0],
+        [0,-1,0],
+        [0,0,1]
+    ], dtype=np.float64)
 
     def __init__(self, robot_name):
         if robot_name == 'ur3':
@@ -56,16 +28,16 @@ class URKinematics():
         elif robot_name == 'ur10e':
             import ur10e_ikfast as ur_ikfast
         else:
-            raise Exception("Unsupported robot")
+            raise Exception("Unsupported robot {}".format(robot_name))
 
         self.kinematics = ur_ikfast.PyKinematics()
         self.n_joints = self.kinematics.getDOF()
 
-    def forward(self, joint_angles, rotation_type='quaternion'):
+    def forward(self, joint_angles, rotation_type='axis_angle'):
         """
             Compute robot's forward kinematics for the specified robot
             joint_angles: list
-            rotation_type: 'quaternion' or 'matrix'
+            rotation_type: 'axis_angle' or 'quaternion' or 'matrix'
             :return: if 'quaternion' then return a list of [x, y, z, w. qx, qy, qz]
                      if 'matrix' then a list of 12 values the 3x3 rotation matrix and 
                      the 3 translational values
@@ -73,17 +45,29 @@ class URKinematics():
         if isinstance(joint_angles, np.ndarray):
             joint_angles = joint_angles.tolist()
 
-        ee_pose = self.kinematics.forward(joint_angles)
-        ee_pose = np.asarray(ee_pose).reshape(3, 4)
+        # convert pose to be consistent with real robot
+        tx_ikbase_tcp = self.kinematics.forward(joint_angles)
+        tx_ikbase_tcp = np.asarray(tx_ikbase_tcp).reshape(3, 4)
+        # rotation transpose equals inverse
+        tx_realbase_tcp = self.rx_ikbase_realbase.T @ tx_ikbase_tcp
 
         if rotation_type == 'matrix':
-            return ee_pose
+            return tx_realbase_tcp
         elif rotation_type == 'quaternion':
-            return pose_quaternion_from_matrix(ee_pose)
+            xyzw = Rotation.from_matrix(tx_realbase_tcp[:,:3]).as_quat()
+            pose = np.concatenate([tx_realbase_tcp[:,3], xyzw[[3,0,1,2]]])
+            return pose
+        elif rotation_type == 'axis_angle':
+            rotvec = Rotation.from_matrix(tx_realbase_tcp[:,:3]).as_rotvec()
+            pose = np.concatenate([tx_realbase_tcp[:,3], rotvec])
+            return pose
+        else:
+            raise RuntimeError("Unsupported rotation_type: {}".format(rotation_type))
 
     def inverse(self, ee_pose, all_solutions=False, q_guess=np.zeros(6)):
         """ Compute robot's inverse kinematics for the specified robot
-            ee_pose: list of 7 if quaternion [x, y, z, w, qx, qy, qz]
+            ee_pose: list of 6 if axis_angle [x, y, z, rx, ry, rz]
+                     list of 7 if quaternion [x, y, z, w, qx, qy, qz]
                      list of 12 if rotation matrix + translational values
             all_solutions: whether to return all the solutions found or just the best one
             q_guess:  if just one solution is request, this set of joint values will be use
@@ -92,13 +76,33 @@ class URKinematics():
                      list of best joint angles if found
                      q_guess if no solution is found
         """
+        ee_pose = np.array(ee_pose)
+        
         pose = None
-        if len(ee_pose) == 7:
-            rot = np.roll(ee_pose[3:], 1)
-            pose = np.concatenate((ee_pose[:3], rot), axis=0)
+        if ee_pose.shape == (6,):
+            pos = ee_pose[:3]
+            rot = Rotation.from_rotvec(ee_pose[3:])
+            mat = np.zeros((3,4))
+            mat[:,:3] = rot.as_matrix()
+            mat[:,3] = pos
+            pose = mat
+        elif ee_pose.shape == (6,):
+            pos = ee_pose[:3]
+            rot = Rotation.from_quat(ee_pose[3:][[1,2,3,0]])
+            mat = np.zeros((3,4))
+            mat[:,:3] = rot.as_matrix()
+            mat[:,3] = pos
+            pose = mat
+        elif ee_pose.shape == (4,4):
+            pose = ee_pose[:3]
         else:
             pose = ee_pose
-        joint_configs = self.kinematics.inverse(pose.reshape(-1).tolist())
+        
+        # convert pose to be consistent with real robot
+        tx_realbase_tcp = pose.reshape(3,4)
+        tx_ikbase_tcp = self.rx_ikbase_realbase @ tx_realbase_tcp
+        
+        joint_configs = self.kinematics.inverse(tx_ikbase_tcp.flatten().tolist())
         n_solutions = int(len(joint_configs)/self.n_joints)
         joint_configs = np.asarray(joint_configs).reshape(n_solutions, self.n_joints)
 

@@ -8,6 +8,11 @@ setup(name='ur_ikfast',
       license='MIT License',
       long_description=open('README.md').read(),
       packages=find_packages(),
+      install_requires=[
+        "numpy",
+        "scipy",
+        "Cython"    
+      ],
       ext_modules=[Extension("ur3e_ikfast",
                              ["ur3e/ur3e_ikfast.pyx",
                               "ur3e/ikfast_wrapper.cpp"], language="c++", libraries=['lapack']),
